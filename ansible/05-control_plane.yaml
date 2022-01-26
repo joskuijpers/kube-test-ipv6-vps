@@ -1,0 +1,100 @@
+---
+- hosts: control1
+  tasks:
+
+  - name: get node ip6 address
+    shell: "ip route get {{ hostvars['edge'].fleet_ip6 }} | awk '{print $9}'"
+    register: route_result
+
+  - name: set ipv6 address fact
+    set_fact:
+      fleet_ip6: "{{ route_result.stdout_lines[0] }}"
+
+  - name: template kubeadm config
+    template:
+      src: ../manifests/kubeadm_config.yaml.j2
+      dest: /home/ubuntu/kubeadm_config.yaml
+      owner: ubuntu
+      mode: 0644
+
+  - name: initialize the cluster
+    become: yes
+    shell: kubeadm init --config /home/ubuntu/kubeadm_config.yaml >> initialized_cluster.txt
+    args:
+      chdir: $HOME
+      creates: initialized_cluster.txt
+
+  - name: create .kube directory
+    file:
+      path: $HOME/.kube
+      state: directory
+      mode: 0700
+
+  - name: copy admin.conf to user's kube config
+    become: yes
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /home/ubuntu/.kube/config
+      remote_src: yes
+      owner: ubuntu
+
+  - name: add kube access for root
+    become: yes
+    lineinfile:
+      dest: /root/.bashrc
+      line: export KUBECONFIG=/etc/kubernetes/admin.conf
+      create: yes
+
+  # This calico version has no controller and only a DeamonSet. We will add IP pools ourselves.
+  - name: template calico to host
+    template:
+      src: ../manifests/calico.yaml.j2
+      dest: /home/ubuntu/calico.yaml
+      owner: ubuntu
+      mode: 0644
+
+  - name: install pod network
+    shell: kubectl apply -f calico.yaml >> pod_network_setup.txt
+    args:
+      chdir: $HOME
+      creates: pod_network_setup.txt
+
+  - name: install ippools
+    block:
+    # For installing pools we need calicoctl pod. As we have no workers, allow pods on the master.
+    - name: untaint master
+      shell: kubectl taint nodes {{ ansible_host }} node-role.kubernetes.io/master-
+
+    - name: install calicoctl
+      shell: kubectl apply -f https://docs.projectcalico.org/manifests/calicoctl.yaml
+
+    - name: add calico ippools
+      shell: |
+        kubectl exec -ti -n kube-system calicoctl -- /calicoctl create -f - <<EOF
+        ---
+        apiVersion: projectcalico.org/v3
+        kind: IPPool
+        metadata:
+          name: pods
+        spec:
+          cidr: {{ pod_cidr }}
+          natOutgoing: true
+          disabled: false
+          nodeSelector: all()
+        ---
+        apiVersion: projectcalico.org/v3
+        kind: IPPool
+        metadata:
+          name: service
+        spec:
+          cidr: {{ service_cidr }}
+          natOutgoing: true
+          disabled: false
+          nodeSelector: all()
+        EOF
+
+    - name: uninstall calicoctl
+      shell: kubectl delete -f https://docs.projectcalico.org/manifests/calicoctl.yaml
+
+    - name: taint master
+      shell: kubectl taint nodes {{ ansible_host }} node-role.kubernetes.io/master=true:NoSchedule

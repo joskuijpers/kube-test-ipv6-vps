@@ -1,0 +1,41 @@
+#!/bin/bash
+
+IP=$(ip route get {{ hostvars['edge'].fleet_ip6 }} | awk '{print $9}')
+
+TMPFILE=/tmp/known-ip-to-ns
+KEY=/usr/local/etc/ddns-key
+
+NS={{ hostvars['edge'].fleet_ip6 }}
+DOMAIN=$(hostname).fleet.
+ZONE=fleet.
+
+if [ -z "$IP" ]; then
+  echo "Not connected"
+  exit
+fi
+
+force='false'
+
+while getopts 'f' flag; do
+  case "${flag}" in
+    f) force='true' ;;
+    *) exit 1 ;;
+  esac
+done
+
+echo "$IP = $DOMAIN"
+
+if [ -f "$TMPFILE" ] && grep -q "$IP" "$TMPFILE" && [ $force == 'false' ]; then
+  echo "No change in IP"
+  exit
+fi
+
+nsupdate -6 -k $KEY -v << EOF
+server $NS
+zone $ZONE
+update delete $DOMAIN AAAA
+update add $DOMAIN 1800 AAAA $IP
+send
+EOF
+
+echo "$IP" > $TMPFILE

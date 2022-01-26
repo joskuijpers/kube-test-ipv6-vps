@@ -1,0 +1,58 @@
+all:
+  hosts:
+    edge:
+      ansible_host: ed01
+      ansible_user: ubuntu
+      fleet_ip6: fd0d:0eae:1d03::1 # static
+      fleet_domain: 'ed01.fleet'
+
+    control1:
+      ansible_host: fn01
+      ansible_user: ubuntu
+      fleet_domain: 'fn01.fleet'
+
+    worker1:
+      ansible_host: fn03
+      ansible_user: ubuntu
+      fleet_domain: 'fn03.fleet'
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+    # Routing between nodes
+    node_cidr: fd0d:0eae:1d03::/64
+    nat64_cidr: 64:ff9b::/96
+
+    # TREX.fi DNS64/NAT64 setup for docker access.
+    upstream_ns1: 2001:67c:2b0::4
+    upstream_ns2: 2001:67c:2b0::6
+
+    ssh_proxy_jump_ip: X.X.X.X # IP4 address of ssh jump node, used for firewall
+    ssh_proxy_jump_ip6: x.x.x.x.x.x.x.x # IP6 address of ssh jump node, used for firewall
+
+  children:
+    fleet:
+      vars:
+        kube_version: '1.23.1-00' #apt
+
+        crio_os: xUbuntu_20.04
+        crio_version: 1.23
+        crio_libcontainers_key_url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ crio_os }}/Release.key"
+        crio_libcontainers_crio_key_url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ crio_version }}/{{ crio_os }}/Release.key"
+        crio_libcontainers_path: /usr/share/keyrings
+        crio_key_cache_path: /root/.crio-cache
+
+        # Routing in Kubernetes
+        node_cidr_mask_size: 120
+        pod_cidr: fd0d:0eae:1d03:1::/104
+        pod_prefix: 'fd0d:0eae:1d03:1::'
+        service_cidr: fd0d:0eae:1d03:2::/112
+        service_prefix: 'fd0d:0eae:1d03:2::'
+
+      children:
+        control_plane:
+          hosts:
+            control1:
+        workers:
+          hosts:
+            worker1:

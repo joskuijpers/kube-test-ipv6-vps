@@ -1,0 +1,88 @@
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+# https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta3/
+
+localAPIEndpoint:
+  # Use the fleet ip for advertisement so the correct interface is used.
+  advertiseAddress: "{{ fleet_ip6 }}"
+
+nodeRegistration:
+  criSocket: "unix:///var/run/crio/crio.sock"
+  name: '{{ ansible_host }}'
+  kubeletExtraArgs:
+    node-ip: "{{ fleet_ip6 }}"
+    container-runtime: remote
+    container-runtime-endpoint: /run/crio/crio.sock
+    network-plugin: cni
+    cluster-dns: '{{ service_prefix }}a'
+
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+# https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta3/#kubeadm-k8s-io-v1beta3-ClusterConfiguration
+
+# Use edge for control plane endpoint so we could scale control nodes.
+controlPlaneEndpoint: "{{ hostvars['edge'].fleet_domain }}:6443"
+
+apiServer:
+  certSANs:
+    - localhost
+    - ::1
+    - {{ fleet_ip6 }}
+    - {{ hostvars['edge'].fleet_domain }}
+    - {{ service_prefix }}1
+    - {{ service_prefix }}a
+    - {{ pod_prefix }}1
+  extraArgs:
+    # authorization-mode: "Node,RBAC"
+    advertise-address: "{{ fleet_ip6 }}"
+    bind-address: '::'
+    etcd-servers: https://[{{ fleet_ip6 }}]:2379
+    service-cluster-ip-range: '{{ service_cidr }}'
+
+controllerManager:
+  extraArgs:
+    allocate-node-cidrs: 'true'
+    bind-address: '::'
+    cluster-cidr: '{{ pod_cidr }}'
+    node-cidr-mask-size-ipv6: '{{ node_cidr_mask_size }}'
+    service-cluster-ip-range: '{{ service_cidr }}'
+
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+    extraArgs:
+      advertise-client-urls: https://[{{ fleet_ip6 }}]:2379
+      initial-advertise-peer-urls: https://[{{ fleet_ip6 }}]:2380
+      initial-cluster: "{{ ansible_host }}=https://[{{ fleet_ip6 }}]:2380"
+      listen-client-urls: https://[{{ fleet_ip6 }}]:2379
+      listen-peer-urls: https://[{{ fleet_ip6 }}]:2380
+
+networking:
+  serviceSubnet: "{{ service_cidr }}"
+  podSubnet: "{{ pod_cidr }}"
+
+scheduler:
+  extraArgs:
+    bind-address: '::'
+
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# kubelet specific options here https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/
+
+cgroupDriver: systemd
+clusterDNS:
+- '{{ service_prefix }}a'
+healthzBindAddress: ::1
+
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+# https://kubernetes.io/docs/reference/config-api/kube-proxy-config.v1alpha1/
+
+# ---
+# apiVersion: kubeadm.k8s.io/v1beta3
+# kind: JoinConfiguration
+# https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta3/#kubeadm-k8s-io-v1beta3-JoinConfiguration

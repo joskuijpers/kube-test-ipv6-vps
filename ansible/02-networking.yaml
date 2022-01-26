@@ -1,0 +1,199 @@
+- hosts: all
+  become: yes
+  tasks:
+  - name: ensure ip_forward is on
+    become: yes
+    sysctl:
+      name: net.ipv4.ip_forward
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+
+  - name: ensure ip6_forwarding is on
+    become: yes
+    sysctl:
+      name: net.ipv6.conf.all.forwarding
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+
+- hosts: fleet
+  become: yes
+  tasks:
+
+  # Disable DNS from ISP as we only want to use our own DNS server which supplies us with DNS64.
+  # Another option is to supply the DNS64 address here.
+  - name: configure ens3 for public internet
+    blockinfile:
+      path: /etc/systemd/network/01-ens3.network
+      block: |
+        [Match]
+        Name=ens3
+
+        [Network]
+        DHCP=true
+        IPForward=true
+        IPMasquerade=true
+        IPv6AcceptRA=true
+
+        [DHCP]
+        UseDNS=false
+
+        [DHCPv4]
+        UseDNS=false
+
+        [DHCPv6]
+        UseDNS=false
+
+        [IPv6AcceptRA]
+        UseDNS=false
+      owner: root
+      group: root
+      mode: '0644'
+      create: true
+    notify:
+    - restart networkd service
+    - restart resolved service
+    - reload systemd
+
+  # The private network runs Routing Advertisement, so enable picking up from that.
+  - name: configure ens7 for private network
+    blockinfile:
+      path: /etc/systemd/network/02-ens7.network
+      block: |
+        [Match]
+        Name=ens7
+
+        [Network]
+        IPv6AcceptRA=true
+        IPForward=true
+        IPMasquerade=true
+
+        [DHCPv6]
+        UseDNS=yes
+        [IPv6AcceptRA]
+        UseDNS=yes
+      owner: root
+      group: root
+      mode: '0644'
+      create: true
+    notify:
+    - restart networkd service
+    - restart resolved service
+    - reload systemd
+
+  # These modules and sysctls are required for container and container networking
+  - name: ensure br_netfilter is loaded
+    modprobe:
+      name: br_netfilter
+      state: present
+    notify:
+    - update initramfs
+
+  - name: ensure overlay is loaded
+    modprobe:
+      name: overlay
+      state: present
+    notify:
+    - update initramfs
+
+  - name: ensure overlay and br_netfilter are loaded at boot for crio
+    copy:
+      content: |
+        # This file create by kubeadm role
+        overlay
+        br_netfilter
+      dest: /etc/modules-load.d/crio.conf
+      mode: 0644
+
+  - name: ensure bridging is on
+    become: yes
+    sysctl:
+      name: net.bridge.bridge-nf-call-iptables
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+
+  - name: ensure bridging ipv6 is on
+    become: yes
+    sysctl:
+      name: net.bridge.bridge-nf-call-ip6tables
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+
+  handlers:
+  - name: reload systemd
+    systemd:
+      daemon_reload: true
+
+  - name: restart resolved service
+    systemd:
+      name: systemd-resolved
+      state: restarted
+
+  - name: restart networkd service
+    systemd:
+      name: systemd-networkd
+      state: restarted
+
+  - name: update initramfs
+    become: yes
+    shell: update-initramfs -u
+
+- hosts: edge
+  become: yes
+  tasks:
+  # Add static IP for edge node as we're running a DNS server and router.
+  - name: add private network ip
+    blockinfile:
+      path: /etc/netplan/01-netcfg.yaml
+      insertafter: '      dhcp6: yes'
+      block: |
+        # Interface for private network 'fleet'
+            ens7:
+              dhcp4: no
+              dhcp6: no
+              accept-ra: no
+              addresses:
+              - {{ fleet_ip6 }}/64
+              nameservers:
+                addresses:
+                - ::1
+    notify:
+    - update netplan
+
+  - name: disable default ISP dns servers
+    lineinfile:
+      backup: yes
+      dest: /etc/systemd/resolved.conf
+      regexp: '{{ item.from }}'
+      line: '{{ item.to }}'
+      state: present
+    with_items:
+    - { from: '^(#)?DNS=', to: 'DNS=::1' }
+    - { from: '^(#)?Domains=', to: 'Domains=~.' }
+    notify:
+    - restart resolved service
+
+  - name: ensure ip4_forwarding is on
+    become: yes
+    sysctl:
+      name: net.ipv4.conf.all.forwarding
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+
+  handlers:
+  - name: restart resolved service
+    systemd:
+      name: systemd-resolved
+      state: restarted
+
+  - name: update netplan
+    command: 'netplan apply'

@@ -1,0 +1,61 @@
+---
+- hosts: fleet
+  become: yes
+  tasks:
+  - name: configure firewall
+    block:
+    - name: Allow everything and enable ufw
+      community.general.ufw:
+        state: enabled
+        default: allow
+
+    - name: Allow SSH access over ens7 from edge.
+      community.general.ufw:
+        rule: allow
+        port: 22
+        proto: tcp
+        src: '{{ hostvars["edge"].fleet_ip6 }}'
+        interface_in: ens7
+
+    - name: Disallow incoming on ens3
+      community.general.ufw:
+        rule: deny
+        interface_in: ens3
+
+- hosts: edge
+  become: yes
+  tasks:
+
+  - name: configure firewall
+    block:
+    - name: Allow everything and enable ufw
+      community.general.ufw:
+        state: enabled
+        default: allow
+
+    - name: Allow management access over ens3 via our proxy
+      community.general.ufw:
+        rule: allow
+        port: 22
+        proto: tcp
+        interface_in: ens3
+        src: '{{ item.address }}'
+      with_items:
+      - { address: '{{ ssh_proxy_jump_ip6 }}' }
+      - { address: '{{ ssh_proxy_jump_ip }}' }
+
+    - name: Allow some web access over ens3
+      community.general.ufw:
+        rule: allow
+        port: '{{ item.port }}'
+        proto: tcp
+        interface_in: ens3
+      with_items:
+      - { port: '80' }
+      - { port: '443' }
+      - { port: '6443' }
+
+    - name: Disallow other incoming on ens3
+      community.general.ufw:
+        rule: deny
+        interface_in: ens3

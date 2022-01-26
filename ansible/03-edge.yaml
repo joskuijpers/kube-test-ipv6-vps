@@ -1,0 +1,264 @@
+---
+- hosts: edge
+  become: yes
+  tasks:
+
+  # DNS
+
+  - name: install bind9
+    apt:
+      name:
+      - bind9
+      - bind9utils
+      - bind9-doc
+      state: present
+
+  - name: allow queries from all nodes
+    blockinfile:
+      path: /etc/bind/named.conf.options
+      insertbefore: 'options {'
+      marker: "# {mark} ANSIBLE MANAGED BLOCK TRUSTED"
+      block: |
+        acl "trusted" {
+          ::1;
+          {{ node_cidr }};
+        };
+    notify:
+    - restart bind
+
+  - name: configure forwarding
+    blockinfile:
+      path: /etc/bind/named.conf.options
+      insertafter: 'options {'
+      marker: "# {mark} ANSIBLE MANAGED BLOCK FORWARDING"
+      block: |
+        # Block
+                recursion yes;                 # enables resursive queries
+                allow-recursion { trusted; };  # allows recursive queries from "trusted" clients
+                listen-on { none; };
+                listen-on-v6 { {{ fleet_ip6 }}; ::1; };
+                allow-query { any; };
+                forwarders {
+                  {{ upstream_ns1 }};
+                  {{ upstream_ns2 }};
+                };
+                #dns64 {{ nat64_cidr }} {};
+    notify:
+    - restart bind
+
+  - name: generate ddns key
+    shell: tsig-keygen ddns-key > /usr/local/etc/ddns-key
+    args:
+      creates: /usr/local/etc/ddns-key
+
+  - name: read ddns key
+    slurp:
+      src: /usr/local/etc/ddns-key
+    register: ddnskeyfile
+
+  - name: set ddns key as fact
+    set_fact:
+      ddns_key: "{{ ddnskeyfile.content }}"
+
+  - name: configure dns zones
+    blockinfile:
+      path: /etc/bind/named.conf.local
+      block: |
+        zone "fleet" {
+              type master;
+              file "/var/lib/bind/db.fleet";
+              allow-update { key ddns-key; };
+        };
+        zone "0.0.0.0.3.0.d.1.e.a.e.0.d.0.d.f.ip6.arpa" {
+              type master;
+              file "/var/lib/bind/db.fd00.0eae.1d03.0";  # fd0d:0eae:1d03:0000/64 subnet
+              allow-update { key ddns-key; };
+        };
+
+        {{ ddns_key | b64decode }}
+    notify:
+    - restart bind
+
+  - name: create zone file
+    copy:
+      dest: /var/lib/bind/db.fleet
+      owner: root
+      group: root
+      mode: '0644'
+      force: no
+      content: |
+        $TTL    604800
+        @       IN      SOA     localhost. root.localhost. (
+                                      6         ; Serial
+                                 604800         ; Refresh
+                                  86400         ; Retry
+                                2419200         ; Expire
+                                 604800 )       ; Negative Cache TTL
+        ;
+                              IN      NS     {{ fleet_domain }}.
+        {{ fleet_domain }}.   IN   AAAA    {{ fleet_ip6 }}
+        edge.fleet.   IN   CNAME    {{ fleet_domain }}.
+        ns.fleet.     IN   CNAME    {{ fleet_domain }}.
+    notify:
+    - restart bind
+
+  - name: create reverse zone file
+    copy:
+      dest: /var/lib/bind/db.fd00.0eae.1d03.0
+      owner: root
+      group: root
+      mode: '0644'
+      force: no
+      content: |
+        $TTL  604800
+        @ IN  SOA {{ fleet_domain }}. edge.fleet. (
+                    6   ; Serial
+               604800   ; Refresh
+                86400   ; Retry
+              2419200   ; Expire
+               604800 ) ; Negative Cache TTL
+        ;
+        @   IN    NS    {{ fleet_domain }}.
+    notify:
+    - restart bind
+
+  # IPV6 RA
+
+  - name: install radvd for ipv6 SLAAC
+    apt:
+      name: radvd
+      state: present
+
+  - name: configure radvd
+    copy:
+      content: |
+        interface ens7 {
+            AdvSendAdvert on;
+
+            prefix {{ node_cidr }} {
+                AdvOnLink on;
+            };
+
+            RDNSS {{ hostvars['edge'].fleet_ip6 }} {
+            };
+        };
+      dest: /etc/radvd.conf
+      mode: 0644
+    notify:
+    - restart radvd
+
+  - name: enable radvd
+    service:
+      name: radvd
+      enabled: yes
+
+  # HAPROXY
+
+  - name: install haproxy
+    apt:
+      name: haproxy
+      state: present
+
+  # Configure haproxy so that public port 80 is forwarded to workers at 31080, the NodePort
+  # Do the same for 443. Enable PROXY so we get access to the client ip.
+  # You can change this to use host IP instead of name, which would arguably be better than using a nameserver.
+  # When the name cannot be resolved, haproxy will not start.
+  # Lastly  add a proxy for 6443. This turns the edge server into HA access of Kubernetes control nodes.
+  - name: configure haproxy
+    blockinfile:
+      path: /etc/haproxy/haproxy.cfg
+      backup: true
+      block: |
+        resolvers fleet_nameservers
+          nameserver ns1 [::1]:53
+
+        frontend ingress_http
+          bind 0.0.0.0:80
+          bind :::80
+          mode tcp
+          default_backend fleet_workers_ingress_http
+          option tcplog
+        backend fleet_workers_ingress_http
+          mode tcp
+          balance roundrobin
+          option tcp-check
+          {% for host in groups['workers'] %}
+        server {{ hostvars[host].inventory_hostname }} {{ hostvars[host].fleet_domain }}:31080 check port 31080 send-proxy resolvers fleet_nameservers
+          {% endfor %}
+
+        frontend ingress_https
+          bind 0.0.0.0:443
+          bind :::443
+          mode tcp
+          default_backend fleet_workers_ingress_https
+          option tcplog
+        backend fleet_workers_ingress_https
+          mode tcp
+          balance roundrobin
+          option tcp-check
+          {% for host in groups['workers'] %}
+        server {{ hostvars[host].inventory_hostname }} {{ hostvars[host].fleet_domain }}:31443 check port 31443 send-proxy resolvers fleet_nameservers
+          {% endfor %}
+
+        frontend kubernetes
+          bind [{{ fleet_ip6 }}]:6443
+          mode tcp
+          default_backend kubernetes_master_nodes
+        backend kubernetes_master_nodes
+          mode tcp
+          balance roundrobin
+          option tcp-check
+          {% for host in groups['control_plane'] %}
+        server {{ hostvars[host].inventory_hostname }} {{ hostvars[host].fleet_domain }}:6443 check fall 3 rise 2 resolvers fleet_nameservers
+          {% endfor %}
+    notify:
+    - restart haproxy
+
+  handlers:
+  - name: restart haproxy
+    service:
+      name: haproxy
+      state: restarted
+
+  - name: restart bind
+    service:
+      name: bind9
+      state: restarted
+
+  - name: restart radvd
+    service:
+      name: radvd
+      state: restarted
+
+- hosts: fleet
+  become: yes
+  tasks:
+
+  # Install a cronjob on each node that will send its IP address and hostname via DDNS to BIND9.
+  - name: add dynamic DNS updates
+    block:
+    - name: set ddns key
+      copy:
+        content: "{{ hostvars['edge'].ddns_key | b64decode }}"
+        dest: /usr/local/etc/ddns-key
+        mode: 0600
+
+    - name: add an DNS update script to notify DNS of hostname
+      template:
+        src: ../templates/ddnsupdate.sh.j2
+        dest: /usr/local/bin/ddnsupdate
+        mode: 0744
+
+    - name: add cronjob for sending hostname to DNS server every 5min
+      cron:
+        name: ddnsupdate
+        minute: '*/5'
+        job: /usr/local/bin/ddnsupdate > /dev/null 2>&1
+        user: root
+
+    - name: add cronjob for sending hostname to DNS server on reboot
+      cron:
+        name: ddnsupdate_reboot
+        special_time: reboot
+        job: /usr/local/bin/ddnsupdate -f > /dev/null 2>&1
+        user: root

@@ -1,0 +1,11 @@
+---
+- hosts: control1
+  tasks:
+  - name: install ingress controller on master
+    shell: echo {{ lookup('template', '../manifests/ingress.yaml.j2')|quote }} | kubectl apply -f -
+
+  - name: install cert-manager
+    shell: kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.6.1/cert-manager.yaml
+
+  - name: install letsencrypt cert issuers
+    shell: echo {{ lookup('file', '../manifests/cluster_issuers.yaml')|quote }} | kubectl apply -f -
