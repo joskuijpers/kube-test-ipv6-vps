@@ -71,6 +71,16 @@ Host bastion
 
 The ipv6 node will still use your ssh agent, so there is no need to add an SSH key from the bastion in your node.
 
+### Private networks
+
+Private networks are great! They generally fix any bandwidth and latency issues in a cluster. However, I found that if you have an ipv4 private network it _needs_ a gateway. Otherwise you get errors with container networking:
+
+> Hit error connecting to datastore - retry error=Get “https://10.96.0.1:443/api/v1/nodes/foo”: dial tcp 10.96.0.1:443: connect: network is unreachable
+
+### Certificate issues
+
+I have had certificate errors inside kubernetes. These were solved by adding more items to the cert-sans in kubeadm_config.yaml.j2.
+
 # Tips
 
 To reset a cluster:
